@@ -1,0 +1,139 @@
+#!/bin/bash
+set -x
+YJ_DIR=$HOME/.yj
+YJ_METADATA_DIR=$YJ_DIR/metadata
+YJ_METADATA_EXPERIMENT_LIST=$YJ_METADATA_DIR/experimentList.tab
+YJ_MODEL="llama2"
+
+show_help() {
+cat << EOF
+Usage:
+    ./yj genome-assembly                                                 # Show available genome-assembly
+    ./yj <genome-assembly> experiment-type                               # Show available experiment-type
+    ./yj <genome-assembly> <experiment-type> cell-type                   # Show available cell-type
+    ./yj <genome assembly> <experiment-type> <cell-type>                 # Show list of attribute names aggregated by LLM
+    ./yj <genome assembly> <experiment-type> <cell-type> experiments     # Show the list of experiments for the given attribute set
+    ./yj <genome assembly> <experiment-type> <cell-type> <experiment_id> # Perform curation of the given experiment
+EOF
+}
+
+download_experiment_list() {
+    if [ ! -e $YJ_METADATA_EXPERIMENT_LIST ]; then
+        echo "Downloading metadata from chip-atlas.dbcls.jp" >&2
+        local url="https://chip-atlas.dbcls.jp/data/metadata/experimentList.tab"
+        mkdir -p $HOME/.yj/metadata
+        curl -s $url > $HOME/.yj/metadata/experimentList.tab
+    fi
+}
+
+show_genome_assembly() {
+    cat $YJ_METADATA_EXPERIMENT_LIST | \
+    cut -d $'\t' -f 2 | sort -u
+}
+
+show_experiment_type() {
+    local genome_assembly=$1
+    cat $YJ_METADATA_EXPERIMENT_LIST | awk -v genome_assembly=$genome_assembly '$2 == genome_assembly' | \
+    cut -d $'\t' -f 3 | sort -u
+}
+
+show_cell_type() {
+    local genome_assembly=$1
+    local experiment_type=$2
+    cat $YJ_METADATA_EXPERIMENT_LIST | \
+      awk -v genome_assembly=$genome_assembly -v experiment_type=$experiment_type '$2 == genome_assembly && $3 == experiment_type' | \
+      cut -d $'\t' -f 5 | sort -u
+}
+
+show_attribute_names() {
+    local genome_assembly=$1
+    local experiment_type=$2
+    local cell_type=$3
+    cat $YJ_METADATA_EXPERIMENT_LIST | \
+      awk -v genome_assembly=$genome_assembly -v experiment_type=$experiment_type -v cell_type=$cell_type '$2 == genome_assembly && $3 == experiment_type && $5 == cell_type' | \
+      cut -d $'\t' -f 10- | tr '\t' '\n' | cut -d '=' -f 1 | sort -u
+}
+
+refine_attribute_name_list_prompt() {
+    local instruction_head=$(cat <<EOF
+<s>[INST] Below is a list of biological attributes utilized in sample annotation experiments.
+Your task is to generate a refined list by eliminating redundancies from the provided attributes.
+The refined list should encompass all key concepts relevant to biological samples and experiments.
+Your answer must be the list only, without additional text. The list should contain only attribute names without numbering, one per line.
+EOF)
+    echo -e $instruction_head "\n\n[LIST]\n"
+    show_attribute_names $1 $2 $3
+    echo -e  "[/INST]\n\nHere is the refined list of biological attributes for sample annotation experiments:"
+}
+
+get_attributes_of_given_experiment() {
+    local experiment_id=$1
+    cat $YJ_METADATA_EXPERIMENT_LIST | awk -v experiment_id=$experiment_id '$1 == experiment_id' | \
+    cut -d $'\t' -f 10- | tr '\t' '\n'
+}
+
+refine_attribute_name_list_prompt() {
+    local attribute_name=$1
+    local instruction_head=$(cat <<EOF
+[INST] From the given sample description, find a decription about the attribute "${attribute_name}".
+When you find a corresponding attribute value, answer ${term}=value. If not found, the value should be NA. Only output, say nothing else.\n\n# Sample description
+EOF)
+    echo -e $instruction_head "\n\n[LIST]\n"
+    show_attribute_names $1 $2 $3
+    echo -e  "[/INST]\n\nHere is the refined list of biological attributes for sample annotation experiments:"
+}
+
+run_yllm() {
+    yllm --api-url "http://localhost:11434/v1/chat/completions" --model $YJ_MODEL --stdin
+}
+
+if [ "$1" == "-h" ]; then
+    show_help
+    exit 0
+elif [ "$1" == "" ]; then
+    show_help
+    exit 1
+else
+    download_experiment_list
+fi
+
+if [ "$1" == "genome-assembly" ]; then
+    echo "The list of genome assembly:"　>&2
+    show_genome_assembly
+else
+    if [ "$2" == "" ]; then
+        echo "The list of experiment type for ${1}:"　>&2
+        show_experiment_type $1
+    else
+        if [ "$3" == "" ]; then
+            echo "The list of cell type for ${1} ${2}:"　>&2
+            show_cell_type $1 $2
+        else
+            if [ "$4" == "" ]; then
+                echo "The list of attributes curated by LLM for ${1} ${2} ${3}:"　>&2
+                attributes_cached=$YJ_METADATA_DIR/$(echo $1 $2 $3 | tr ' ' '_')_attributes.tab
+                if [ -e $attributes_cached ]; then
+                    cat $attributes_cached
+                else
+                    echo "${YJ_MODEL} is aggregating the attribute names for ${1} ${2} ${3}.."　>&2
+                    refine_attribute_name_list_prompt $1 $2 $3 | run_yllm | tee $attributes_cached
+                fi
+            else
+                if [ "$4" == "experiments" ]; then
+                    echo "The list of experiments for ${1} ${2} ${3}:"　>&2
+                    experiments_cached=$YJ_METADATA_DIR/$(echo $1 $2 $3 | tr ' ' '_')_experiments.tab
+                    if [ -e $experiments_cached ]; then
+                        cat $experiments_cached
+                    else
+                        cat $YJ_METADATA_EXPERIMENT_LIST | \
+                        awk -v genome_assembly=$1 -v experiment_type=$2 -v cell_type=$3 '$2 == genome_assembly && $3 == experiment_type && $5 == cell_type' | \
+                        cut -d $'\t' -f 1 | tee $experiments_cached
+                    fi
+                else
+                    echo "show the list of attributes curated by LLM for ${1} ${2} ${3}"
+                    get_attributes_of_given_experiment $4
+                fi
+            fi
+        fi
+    fi
+fi
